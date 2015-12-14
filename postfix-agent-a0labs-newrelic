@@ -1,0 +1,202 @@
+#!/usr/bin/python
+
+import httplib, urllib, csv, urllib2, socket, os, time, json, datetime, requests, ConfigParser, sys, traceback, subprocess, re
+
+def	my_int(sth):
+	if (sth == None or sth.isdigit() == False):
+		return 0
+	return int(sth)
+
+class LogsType:
+	ERROR = "ERR"
+	WARNING = "WRG"
+
+def singleton(cls):
+	instance=cls()
+	cls.__new__ = cls.__call__= lambda cls: instance
+	cls.__init__ = lambda self: None
+	return instance
+
+@singleton
+class Config():
+	def get(self, section, item):
+		return self.cp.get(section, item)
+	
+	def getInt(self, section, item):
+		return self.cp.getint(section, item)
+
+	def getBoolean(self, section, item):
+		return self.cp.getboolean(section, item)
+
+	def __init__(self):
+		self.cp = ConfigParser.RawConfigParser()
+		self.cp.read('/etc/newrelic/postfix-agent-a0labs.cfg')
+
+class Agent:
+	def update_postdata(self):
+		self.post_data['components'] = []
+		for component in self.components:
+			self.post_data['components'].append(self.components[component])
+
+	def log(self, errtype, message):
+		self.logs_file.write("[" + errtype + "]" + ' ' + str(datetime.datetime.now()) + ' : ' + message +'\n')
+
+	def populateMetrics(self, metrics, value_type, scale, value):
+		label = "Component/" + value_type + "[" + scale + "]"
+		if (value == 'Y'):
+			value = 1
+		if (value == None or value == ''):
+			value = 0
+		if label in metrics:
+			yet = metrics[label]
+			if type(yet) is dict:
+				yet['min'] = (yet['min'] < value and yet['min'] or value)
+				yet['max'] = (yet['max'] > value and yet['max'] or value)
+				yet['total'] += value
+				yet['count'] += 1
+				yet['sum_of_squares'] += (value * value)
+				metrics[label] = yet
+			else:
+				metrics[label] = {}
+				metrics[label]['min'] = (yet < value and yet or value)
+				metrics[label]['max'] = (yet > value and yet or value)
+				metrics[label]['total'] = yet + value
+				metrics[label]['count'] = 2
+				metrics[label]['sum_of_squares'] = (yet * yet + value * value)
+		else:
+			metrics[label] = value
+
+	def populateDeltaMetrics(self, name, metrics, value_type, scale, value):
+		label = "Component/" + value_type + "[" + scale + "]"
+		if (name not in self.old):
+			self.old[name] = {}
+		if (value == None or value == ''):
+			value = 0
+		delta = 0
+		if label in self.old[name] and value > self.old[name][label]:
+			delta = value - self.old[name][label]
+		self.old[name][label] = value
+		self.populateMetrics(metrics, value_type, scale, delta)
+	
+	def get_postfix_data(self):
+		proc = subprocess.Popen(["cat /var/log/mail.log | pflogsumm --detail 0 -q -d today"], stdout=subprocess.PIPE, shell=True)
+		(out, err) = proc.communicate()
+		ret = {}
+		for line in out.split('\n'):
+			line = re.sub(r'\([^)]*\)', '', line)
+			content = line.split()
+			if (len(content) > 0):
+				if (content[0].isdigit()):
+					print line
+					ret[content[1]] = my_int(content[0])
+		return ret
+
+	def post_datas(self):
+		post_json = json.dumps(self.post_data, sort_keys=True, indent=4)
+		print post_json
+		headers = {"Content-Type": "application/json",
+					"Accept": "application/json","X-License-Key": self.newrelic_license}
+
+		conn = httplib.HTTPSConnection(self.platform_api_ip, timeout=5)
+		conn.request("POST", self.platform_api_url, post_json, headers)
+		response = conn.getresponse()
+		return (response.status)
+
+	def get_component_from_csv(self, row):
+		duration = int(time.time() - self.last_poll_time)
+                if (self.agent_host not in self.components):
+                        tmp_component = {}
+                        tmp_component['name'] = self.agent_host
+                        tmp_component['guid'] = self.guid
+                        tmp_component['duration'] = duration
+                        self.components[self.agent_host] = tmp_component
+                        metrics = {}
+                else:
+                        metrics = self.components[self.agent_host]['metrics']
+                self.components[self.agent_host]['duration'] = duration
+
+                self.populateDeltaMetrics(self.agent_host, metrics, "Mails/Received", "Mails", row['received'])
+                self.populateDeltaMetrics(self.agent_host, metrics, "Mails/Delivered", "Mails", row['delivered'])
+                self.populateDeltaMetrics(self.agent_host, metrics, "Mails/Forwarded", "Mails", row['forwarded'])
+                self.populateDeltaMetrics(self.agent_host, metrics, "Mails/Deferred", "Mails", row['deferred'])
+                self.populateDeltaMetrics(self.agent_host, metrics, "Mails/Bounced", "Mails", row['bounced'])
+                self.populateDeltaMetrics(self.agent_host, metrics, "Mails/Rejected", "Mails", row['rejected'])
+                self.populateDeltaMetrics(self.agent_host, metrics, "Mails/Rejected_warning", "Operations", row['reject'])
+                self.populateDeltaMetrics(self.agent_host, metrics, "Mails/held", "Operations", row['reject'])
+                self.populateDeltaMetrics(self.agent_host, metrics, "Mails/discard", "Operations", row['reject'])
+
+                writes += row['symlink'] + row['setattr'] + row['commit']
+                
+                self.components[self.agent_host]['metrics'] = metrics
+
+	def run(self):
+		run = True
+		code = 200
+		while (run):
+			try:
+				data = self.get_postfix_data()
+				return
+				self.get_component_from_csv(data)
+				self.update_postdata()
+				code = self.post_datas()
+				if (code == 200):
+					# Clearing component cash
+					self.components = {}
+					self.last_poll_time = time.time()
+				elif (code == 400):
+					self.log(LogsType.ERROR, " 400 error encontered, request uncorrect")
+					run = False
+				elif (code == 403):
+					self.log(LogsType.ERROR, " 403 acces forbidden, checkout your license key")
+					run = False
+				elif (code == 404):
+					self.log(LogsType.ERROR, " 404 bad URL - checkout with developper of this application")
+					run = False
+				elif (code == 415):
+					self.log(LogsType.ERROR, " 415 request incorrect")
+					run = False
+			except Exception as e:
+				traceback.print_exc(file=sys.stdout)
+				self.log(LogsType.ERROR, str(e))
+				code = "THROWN"
+			if (run):
+				time.sleep( int(self.poll_cycle))
+				
+	def __init__(self):
+		# Init NewRelic Variables
+		self.platform_api_uri = Config().get('NewRelicAPI', 'uri')
+		self.platform_api_url = Config().get('NewRelicAPI', 'url')
+		self.platform_api_ip = Config().get('NewRelicAPI', 'ip')
+		self.newrelic_license = Config().get('NewRelicAPI', 'license_key')
+		self.poll_cycle = Config().getInt('NewRelicAPI', 'poll_cycle')
+
+		# Init of agent informations
+		self.guid = Config().get('Agent', 'guid')
+		self.agent_host = socket.gethostname()
+		self.agent_pid = os.getpid()
+		self.version = Config().get('Agent', 'version')
+		self.agent_hash = {'host' : self.agent_host, 'pid' : self.agent_pid, 'version' : str(self.version)}
+
+		# Init old dict for delta computing values
+		self.old = {}
+		
+		# Init time of program start
+		self.last_poll_time = time.time() - float(self.poll_cycle)
+
+		# Init of component
+		self.components = {}
+
+		# Init post_datas
+		self.post_data = {'agent': self.agent_hash, 'components':[]}
+
+		# Init Logs
+		self.logs_enabled = Config().getBoolean('Logs', 'enable')
+		if (self.logs_enabled):
+			self.logs_file = open(Config().get('Logs', 'file'), 'a')
+			if (self.logs_file == None):
+				sys.stderr.write('Impossible to open log_file, no logs saved')
+				self.logs_enabled  = False
+
+if __name__ == '__main__':
+	p = Agent()
+	p.run()
