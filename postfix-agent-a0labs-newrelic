@@ -125,8 +125,6 @@ class Agent:
                 self.populateDeltaMetrics(self.agent_host, metrics, "Mails/held", "Operations", row['reject'])
                 self.populateDeltaMetrics(self.agent_host, metrics, "Mails/discard", "Operations", row['reject'])
 
-                writes += row['symlink'] + row['setattr'] + row['commit']
-                
                 self.components[self.agent_host]['metrics'] = metrics
 
 	def run(self):
@@ -135,7 +133,6 @@ class Agent:
 		while (run):
 			try:
 				data = self.get_postfix_data()
-				return
 				self.get_component_from_csv(data)
 				self.update_postdata()
 				code = self.post_datas()
